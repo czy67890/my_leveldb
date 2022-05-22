@@ -6,7 +6,7 @@
 
 #include"leveldb/export.h"
 
-namespace leveldb{
+namespace czy_leveldb{
     //LEVELDB_EXPORT
     //用于导出DLL文件时，防止c++链接问题
 class LEVELDB_EXPORT Slice{
@@ -71,7 +71,18 @@ inline bool operator!=(const Slice & x,const Slice & y ){
 }
 
 
-
 inline int Slice::compare(const Slice & b) const{
-    
+    const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
+    int r = memcmp(data_,b.data_,min_len);
+    if(r == 0){
+        if(size_ < b.size_){
+            r = -1;
+        }
+        else if(size_ >b.size_){
+            r = 1;
+        }
+    }
+    return r;   
 }
+
+}//namespace leveldb
