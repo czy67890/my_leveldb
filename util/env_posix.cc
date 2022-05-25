@@ -127,4 +127,123 @@ private:
     const std::string filename_;
 };
 
+
+class PosixRandomAccessFile final : public RandomAccessFile{
+public:
+    //random File 的构造函数
+    //如果达到limiter
+    //那么不能再打开文件
+    PosixRandomAccessFile(std::string filename,int fd, Limiter * fd_limiter)
+    :has_permanent_fd_(fd_limiter->Acquire()),fd_(has_permanent_fd_ ? fd : -1),
+     fd_limiter_(fd_limiter),file_name_(std::move(filename))
+    { 
+        if(!has_permanent_fd_){
+            assert(fd_ == -1);
+            ::close(fd);
+        }
+    }
+    ~PosixRandomAccessFile() override{
+        if(has_permanent_fd_){
+            assert(fd_ != -1);
+            ::close(fd_);
+            fd_limiter_->Release();
+        }
+    }
+
+    Status Read(uint64_t offset,size_t n ,Slice * result,char * scratch) const override{
+        int fd = fd_;
+        if(!has_permanent_fd_){
+            fd = ::open(file_name_.c_str(),O_RDONLY | kOpenBaseFlags);
+            if(fd < 0){
+                return PosixError(file_name_,errno);
+            }
+        }
+        assert(fd != -1);
+        Status status;
+        //pread 就是lseek和read的联合体
+        //这样做的时候lseek和read是一个原子操作
+        ssize_t read_size = :: pread(fd,scratch,n,static_cast<off_t>(offset));
+        *result = Slice(scratch,(read_size < 0) ? 0:read_size);
+        if(read_size < 0){
+            status = PosixError (file_name_,errno);
+        }
+        if(!has_permanent_fd_){
+            assert(fd != fd_);
+            close(fd);
+        }
+        return status;
+    }
+private:
+    const bool has_permanent_fd_;
+    const int fd_;
+    Limiter * const fd_limiter_;
+    const std::string file_name_;
+};
+
+class PosixMmapReadableFile final : public RandomAccessFile{
+public: 
+    PosixMmapReadableFile(std::string filename, char * mmap_base,size_t length,
+                            Limiter * mmap_limiter
+    )
+     :mmap_base_(mmap_base),
+      length_(length),
+      mmap_limiter_(mmap_limiter),
+      filename_(std::move(filename))
+    { }
+    ~PosixMmapReadableFile() override{
+        ::munmap(static_cast<void *> (mmap_base_),length_);
+        mmap_limiter_->Release();
+    }
+
+    Status Read (uint64_t offset,size_t n ,Slice * result,char * scratch) const override{
+        if(offset + n > length_){
+            *result = Slice();
+            //EINVAL::向函数传递了无效参数
+            return PosixError(filename_,EINVAL);
+        }
+        *result = Slice(mmap_base_ + offset ,n);
+        return Status::OK();
+    }
+private:
+    char * const mmap_base_;
+    const size_t length_;
+    Limiter* const mmap_limiter_;
+    const std:: string filename_;
+};
+
+class PosixWritableFile final : public WritableFile{
+
+private:
+    Status FlushBuffer(){
+        Status status = WriteUnbuffered(buf_,pos_);
+        pos_ = 0;
+        return status;
+    }
+
+    Status WriteUnbuffered(const char * data,size_t size){
+        while(size > 0){
+            ssize_t write_result = :: write(fd_ ,data,size);
+            while(write_result < 0){
+                if(errno  == EINTR){
+                    continue;
+                }
+                return PosixError(filename_,errno);
+            }
+            data += write_result;
+            size -= write_result;
+        }
+        return Status::OK();
+    }
+
+    Status SyncDirIfManifest(){
+        
+    }
+    char buf_[KWritableFileBufferSize];
+    size_t pos_;
+    int fd_;
+
+    const bool is_manifest_;//是否为显式文件
+    const std::string filename_;
+    const std::string dirname_;
+};
 }
