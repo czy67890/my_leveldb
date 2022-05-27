@@ -212,7 +212,66 @@ private:
 };
 
 class PosixWritableFile final : public WritableFile{
+public:
+    PosixWritableFile(std::string filename ,int fd)
+        :pos_(0),fd_(fd),is_manifest_(IsMainifest(filename)),filename_(std::move(filename)),dirname_(Dirname(filename_))
+    {
 
+    }
+
+    ~PosixWritableFile() override {
+        if(fd_ >= 0){
+            Close();
+        }
+    }
+
+    Status Append(const Slice & data) override{
+        size_t write_size = data.size();
+        const char * write_data = data.data();
+
+        size_t copy_size = std::min(write_size,KWritableFileBufferSize);
+        std::memcpy(buf_ + pos_,write_data,copy_size);
+        write_data += copy_size;
+        write_size -= copy_size;
+        pos_ += copy_size;
+
+        if(write_size == 0){
+            return Status::OK();
+        }
+
+        Status status = FlushBuffer();
+        if(!status.ok()){
+            return status;
+        }
+
+
+        //once can write down
+        if(write_size < KWritableFileBufferSize){
+            std::memcpy(buf_,write_data,write_size);
+            pos_ = write_size;
+            return Status::OK();
+        }
+        return WriteUnbuffered(write_data,write_size);
+    }
+
+    Status Close() override{
+        Status status = FlushBuffer();
+        const int close_result = ::close(fd_);
+        if(close_result < 0 && status.ok()){
+            status = PosixError(filename_,errno);
+        }
+        fd_ = -1;
+        return status;
+    }
+
+    Status Flush() override{ return FlushBuffer();}
+    Status Sync() override{
+        Status status = SyncDirIfManifest();
+        if(!status.ok()){
+            return status;
+        }
+        return SyncFd(fd_,filename_);
+    }
 private:
     Status FlushBuffer(){
         Status status = WriteUnbuffered(buf_,pos_);
@@ -220,6 +279,7 @@ private:
         return status;
     }
 
+    //写未缓冲的到文件描述符
     Status WriteUnbuffered(const char * data,size_t size){
         while(size > 0){
             ssize_t write_result = :: write(fd_ ,data,size);
@@ -234,9 +294,50 @@ private:
         }
         return Status::OK();
     }
-
     Status SyncDirIfManifest(){
-        
+        Status status;
+        if(!is_manifest_){
+            return status;
+        }
+        int fd = ::open(dirname_.c_str(),O_RDONLY|kOpenBaseFlags);
+        if(fd < 0){
+            status = PosixError(dirname_,errno);
+        }
+        else{
+            status = SyncFd(fd,dirname_);
+            ::close(fd);
+        }
+        return status;
+    }
+    static Status SyncFd(int fd,const std::string &fd_path){
+        //fsync会将修改的数据和文件描述符永久的存放到disk中
+        bool sync_success = ::fsync(fd) == 0;
+        if(sync_success){
+            return Status::OK();
+        }
+        return PosixError(fd_path,errno);
+    }
+
+    static std::string Dirname(const std::string &filename){
+        std::string::size_type separator_pos = filename.rfind('/');
+        if(separator_pos == std::string::npos){
+            return std::string(".");
+        }
+        assert(filename.find('/',separator_pos + 1) == std::string::npos);
+        return filename.substr(0,separator_pos);
+    }
+
+    static Slice Basename(const std::string & filename){
+        std::string::size_type separator_pos = filename.rfind('/');
+        if(separator_pos == std::string::npos){
+            return Slice(filename);
+        }
+        assert(filename.find('/',separator_pos + 1) == std::string::npos);
+        return Slice(filename.data() + separator_pos + 1 ,filename.length() - separator_pos - 1);
+    }
+
+    static bool IsMainifest(const std::string & filename){
+        return Basename(filename ).starts_with("MANIFEST");
     }
     char buf_[KWritableFileBufferSize];
     size_t pos_;
